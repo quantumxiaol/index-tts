@@ -432,6 +432,11 @@ class IndexTTS2:
                 self.cache_s2mel_prompt = None
                 self.cache_mel = None
                 torch.cuda.empty_cache()
+                if "mps" in str(self.device):
+                    try:
+                        torch.mps.empty_cache()
+                    except Exception:
+                        pass
             audio,sr = self._load_and_cut_audio(spk_audio_prompt,15,verbose)
             audio_22k = torchaudio.transforms.Resample(sr, 22050)(audio)
             audio_16k = torchaudio.transforms.Resample(sr, 16000)(audio)
@@ -486,6 +491,11 @@ class IndexTTS2:
             if self.cache_emo_cond is not None:
                 self.cache_emo_cond = None
                 torch.cuda.empty_cache()
+                if "mps" in str(self.device):
+                    try:
+                        torch.mps.empty_cache()
+                    except Exception:
+                        pass
             emo_audio, _ = self._load_and_cut_audio(emo_audio_prompt,15,verbose,sr=16000)
             emo_inputs = self.extract_features(emo_audio, sampling_rate=16000, return_tensors="pt")
             emo_input_features = emo_inputs["input_features"]
