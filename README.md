@@ -202,6 +202,73 @@ uv run webui.py -h
 
 For production deployment, see the [vLLM recipe for IndexTTS](https://recipes.vllm.ai/IndexTeam/IndexTTS-2.5).
 
+### 🚀 FastAPI and MCP services
+
+After installing dependencies and downloading the checkpoints, start the HTTP
+API from the repository root:
+
+```bash
+PYTHONPATH="$PYTHONPATH:." uv run python fastapi_service/service.py
+```
+
+The service listens on `http://127.0.0.1:8000` by default. You can change the
+port or model options with environment variables:
+
+```bash
+PORT=8000 \
+INDEXTTS_MODEL_DIR=checkpoints \
+INDEXTTS_CONFIG_PATH=checkpoints/config.yaml \
+INDEXTTS_DEVICE=cuda:0 \
+INDEXTTS_USE_BF16=1 \
+PYTHONPATH="$PYTHONPATH:." uv run python fastapi_service/service.py
+```
+
+Useful environment variables:
+
+- `PORT`: HTTP port, default `8000`.
+- `INDEXTTS_MODEL_DIR`: model directory, default `checkpoints`.
+- `INDEXTTS_CONFIG_PATH`: config path, default `checkpoints/config.yaml`.
+- `INDEXTTS_DEVICE`: optional device override such as `cuda:0`, `mps`, or `cpu`.
+- `INDEXTTS_USE_BF16`: set to `1` to enable BF16 where supported.
+- `INDEXTTS_USE_CUDA_KERNEL`: set to `1` to enable the CUDA kernel path.
+- `INDEXTTS_USE_DEEPSPEED`: set to `1` to enable DeepSpeed.
+- `INDEXTTS_USE_QWEN_EMO`: emotion-text guidance is enabled by default; set to `0` to disable it.
+- `INDEXTTS_USE_ACCEL`: set to `1` to enable the GPT acceleration engine.
+- `INDEXTTS_USE_TORCH_COMPILE`: set to `1` to enable `torch.compile`.
+- `TTS_INPUT_DIR`: directory for copied or downloaded prompt audio, default `inputs`.
+- `TTS_OUTPUT_DIR`: directory for generated audio, default `outputs`.
+
+Available endpoints:
+
+- `POST /tts/synthesize`: synthesize one text input.
+- `POST /tts/batch_file`: synthesize one output per non-empty line in a text file.
+
+Example request with the included client:
+
+```bash
+PYTHONPATH="$PYTHONPATH:." uv run python fastapi_service/client.py synthesize \
+  --prompt-wav-path examples/voice_01.wav \
+  --lang EN \
+  --text "Translate for me, what is a surprise!" \
+  --output-name api_test.wav
+```
+
+The response includes the generated file path. By default, generated audio is
+written under `outputs/`. Interactive API documentation is available at
+`http://127.0.0.1:8000/docs`.
+
+The MCP server exposes the same `tts_synthesize` and `tts_batch_file` operations.
+It uses STDIO by default, or Streamable HTTP (with the legacy SSE route retained)
+when started with `--http`:
+
+```bash
+# STDIO
+PYTHONPATH="$PYTHONPATH:." uv run python mcp_service/server.py
+
+# Streamable HTTP at http://127.0.0.1:8890/mcp
+PYTHONPATH="$PYTHONPATH:." uv run python mcp_service/server.py --http --port 8890
+```
+
 ### 📝 Python API
 
 To run scripts, use `uv run <file.py>` so the code runs inside the `uv`

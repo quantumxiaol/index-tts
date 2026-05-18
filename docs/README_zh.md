@@ -188,6 +188,69 @@ uv run webui.py -h
 
 生产环境部署请参考 [IndexTTS 的 vLLM 部署方案](https://recipes.vllm.ai/IndexTeam/IndexTTS-2.5)。
 
+### 🚀 FastAPI 和 MCP 服务
+
+安装依赖并下载模型后，在仓库根目录启动 HTTP 服务：
+
+```bash
+PYTHONPATH="$PYTHONPATH:." uv run python fastapi_service/service.py
+```
+
+服务默认监听 `http://127.0.0.1:8000`。可通过环境变量调整端口和模型参数：
+
+```bash
+PORT=8000 \
+INDEXTTS_MODEL_DIR=checkpoints \
+INDEXTTS_CONFIG_PATH=checkpoints/config.yaml \
+INDEXTTS_DEVICE=cuda:0 \
+INDEXTTS_USE_BF16=1 \
+PYTHONPATH="$PYTHONPATH:." uv run python fastapi_service/service.py
+```
+
+常用环境变量：
+
+- `PORT`：HTTP端口，默认 `8000`。
+- `INDEXTTS_MODEL_DIR`：模型目录，默认 `checkpoints`。
+- `INDEXTTS_CONFIG_PATH`：配置文件路径，默认 `checkpoints/config.yaml`。
+- `INDEXTTS_DEVICE`：可选设备，例如 `cuda:0`、`mps` 或 `cpu`。
+- `INDEXTTS_USE_BF16`：设为 `1` 可在支持的设备上开启 BF16。
+- `INDEXTTS_USE_CUDA_KERNEL`：设为 `1` 可开启 CUDA kernel 路径。
+- `INDEXTTS_USE_DEEPSPEED`：设为 `1` 可开启 DeepSpeed。
+- `INDEXTTS_USE_QWEN_EMO`：默认开启文本情感控制，设为 `0` 可关闭。
+- `INDEXTTS_USE_ACCEL`：设为 `1` 可开启 GPT 加速引擎。
+- `INDEXTTS_USE_TORCH_COMPILE`：设为 `1` 可开启 `torch.compile`。
+- `TTS_INPUT_DIR`：参考音频复制或下载目录，默认 `inputs`。
+- `TTS_OUTPUT_DIR`：生成音频输出目录，默认 `outputs`。
+
+接口：
+
+- `POST /tts/synthesize`：合成单条文本。
+- `POST /tts/batch_file`：按文本文件中的非空行批量合成。
+
+使用内置客户端调用示例：
+
+```bash
+PYTHONPATH="$PYTHONPATH:." uv run python fastapi_service/client.py synthesize \
+  --prompt-wav-path examples/voice_01.wav \
+  --lang EN \
+  --text "Translate for me, what is a surprise!" \
+  --output-name api_test.wav
+```
+
+响应中会返回生成文件路径。默认情况下，生成音频会写入 `outputs/`，交互式文档位于
+`http://127.0.0.1:8000/docs`。
+
+MCP 服务提供相同的 `tts_synthesize` 和 `tts_batch_file` 能力，默认使用 STDIO，
+也可启动 Streamable HTTP：
+
+```bash
+# STDIO
+PYTHONPATH="$PYTHONPATH:." uv run python mcp_service/server.py
+
+# Streamable HTTP：http://127.0.0.1:8890/mcp
+PYTHONPATH="$PYTHONPATH:." uv run python mcp_service/server.py --http --port 8890
+```
+
 ### 📝 Python 脚本调用
 
 运行脚本时请使用 `uv run <file.py>`，保证程序在 uv 创建的虚拟环境下运行。
