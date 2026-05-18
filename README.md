@@ -9,9 +9,6 @@
 <a href="README.md" style="font-size: 24px">English</a>
 </div>
 
-## The repository history has been reset. Please delete your local copy and re-clone.
-## （仓库历史已重置。请删除本地副本并重新克隆。）
-
 ## 👉🏻 IndexTTS2 👈🏻
 
 <center><h3>IndexTTS2: A Breakthrough in Emotionally Expressive and Duration-Controlled Auto-Regressive Zero-Shot Text-to-Speech</h3></center>
@@ -289,6 +286,56 @@ Have fun!
 > before running `uv` commands, since that could lead to dependency conflicts!
 
 
+#### 🚀 FastAPI Service
+
+After installing dependencies and downloading the checkpoints, start the HTTP
+service from the repository root:
+
+```bash
+PYTHONPATH="$PYTHONPATH:." uv run python fastapi_service/service.py
+```
+
+The service listens on `http://127.0.0.1:8000` by default. You can change the
+port or model options with environment variables:
+
+```bash
+PORT=8000 \
+INDEXTTS_MODEL_DIR=checkpoints \
+INDEXTTS_CONFIG_PATH=checkpoints/config.yaml \
+INDEXTTS_DEVICE=cuda:0 \
+PYTHONPATH="$PYTHONPATH:." uv run python fastapi_service/service.py
+```
+
+Useful environment variables:
+
+- `PORT`: HTTP port, default `8000`.
+- `INDEXTTS_MODEL_DIR`: model directory, default `checkpoints`.
+- `INDEXTTS_CONFIG_PATH`: config path, default `checkpoints/config.yaml`.
+- `INDEXTTS_DEVICE`: optional device override such as `cuda:0`, `mps`, or `cpu`.
+- `INDEXTTS_USE_FP16`: set to `1` to enable FP16 where supported.
+- `INDEXTTS_USE_CUDA_KERNEL`: set to `1` to enable the CUDA kernel path.
+- `INDEXTTS_USE_DEEPSPEED`: set to `1` to enable DeepSpeed.
+- `TTS_INPUT_DIR`: directory for copied or downloaded prompt audio, default `inputs`.
+- `TTS_OUTPUT_DIR`: directory for generated audio, default `outputs`.
+
+Available endpoints:
+
+- `POST /tts/synthesize`: synthesize one text input.
+- `POST /tts/batch_file`: synthesize one output per non-empty line in a text file.
+
+Example request with the included client:
+
+```bash
+PYTHONPATH="$PYTHONPATH:." uv run python fastapi_service/client.py synthesize \
+  --prompt-wav-path examples/voice_01.wav \
+  --text "Translate for me, what is a surprise!" \
+  --output-name api_test.wav
+```
+
+The response includes the generated file path. By default, generated audio is
+written under `outputs/`.
+
+
 #### 📝 Using IndexTTS2 in Python
 
 To run scripts, you *must* use the `uv run <file.py>` command to ensure that
@@ -347,8 +394,8 @@ tts.infer(spk_audio_prompt='examples/voice_07.wav', text=text, output_path="gen.
 ```python
 from indextts.infer_v2 import IndexTTS2
 tts = IndexTTS2(cfg_path="checkpoints/config.yaml", model_dir="checkpoints", use_fp16=False, use_cuda_kernel=False, use_deepspeed=False)
-text = "对不起嘛！我的记性真的不太好，但是和你在一起的事情，我都会努力记住的~"
-tts.infer(spk_audio_prompt='examples/09.wav', text=text, output_path="gen.wav", emo_vector=[0, 0, 0.8, 0, 0, 0, 0, 0], use_random=False, verbose=True)
+text = "哇塞！这个爆率也太高了！欧皇附体了！"
+tts.infer(spk_audio_prompt='examples/voice_10.wav', text=text, output_path="gen.wav", emo_vector=[0, 0, 0, 0, 0, 0, 0.45, 0], use_random=False, verbose=True)
 ```
 
 5. Alternatively, you can enable `use_emo_text` to guide the emotions based on

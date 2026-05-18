@@ -231,6 +231,52 @@ uv run webui.py -h
 
 祝使用愉快！
 
+#### 🚀 FastAPI服务
+
+安装依赖并下载模型后，在仓库根目录启动HTTP服务：
+
+```bash
+PYTHONPATH="$PYTHONPATH:." uv run python fastapi_service/service.py
+```
+
+服务默认监听 `http://127.0.0.1:8000`。可通过环境变量调整端口和模型参数：
+
+```bash
+PORT=8000 \
+INDEXTTS_MODEL_DIR=checkpoints \
+INDEXTTS_CONFIG_PATH=checkpoints/config.yaml \
+INDEXTTS_DEVICE=cuda:0 \
+PYTHONPATH="$PYTHONPATH:." uv run python fastapi_service/service.py
+```
+
+常用环境变量：
+
+- `PORT`：HTTP端口，默认 `8000`。
+- `INDEXTTS_MODEL_DIR`：模型目录，默认 `checkpoints`。
+- `INDEXTTS_CONFIG_PATH`：配置文件路径，默认 `checkpoints/config.yaml`。
+- `INDEXTTS_DEVICE`：可选设备，例如 `cuda:0`、`mps` 或 `cpu`。
+- `INDEXTTS_USE_FP16`：设为 `1` 可在支持的设备上开启FP16。
+- `INDEXTTS_USE_CUDA_KERNEL`：设为 `1` 可开启CUDA kernel路径。
+- `INDEXTTS_USE_DEEPSPEED`：设为 `1` 可开启DeepSpeed。
+- `TTS_INPUT_DIR`：参考音频复制或下载目录，默认 `inputs`。
+- `TTS_OUTPUT_DIR`：生成音频输出目录，默认 `outputs`。
+
+接口：
+
+- `POST /tts/synthesize`：合成单条文本。
+- `POST /tts/batch_file`：按文本文件中的非空行批量合成。
+
+使用内置客户端调用示例：
+
+```bash
+PYTHONPATH="$PYTHONPATH:." uv run python fastapi_service/client.py synthesize \
+  --prompt-wav-path examples/voice_01.wav \
+  --text "Translate for me, what is a surprise!" \
+  --output-name api_test.wav
+```
+
+响应中会返回生成文件路径。默认情况下，生成音频会写入 `outputs/`。
+
 #### 📝 Python脚本调用
 
 用`uv run <file.py>`保证程序在uv创建的虚拟环境下运行。部分情况需要指定`PYTHONPATH`。
@@ -278,8 +324,8 @@ tts.infer(spk_audio_prompt='examples/voice_07.wav', text=text, output_path="gen.
 ```python
 from indextts.infer_v2 import IndexTTS2
 tts = IndexTTS2(cfg_path="checkpoints/config.yaml", model_dir="checkpoints", use_fp16=False, use_cuda_kernel=False, use_deepspeed=False)
-text = "对不起嘛！我的记性真的不太好，但是和你在一起的事情，我都会努力记住的~"
-tts.infer(spk_audio_prompt='examples/voice_09.wav', text=text, output_path="gen.wav", emo_vector=[0, 0, 0.8, 0, 0, 0, 0, 0], use_random=False, verbose=True)
+text = "哇塞！这个爆率也太高了！欧皇附体了！"
+tts.infer(spk_audio_prompt='examples/voice_10.wav', text=text, output_path="gen.wav", emo_vector=[0, 0, 0, 0, 0, 0, 0.45, 0], use_random=False, verbose=True)
 ```
 
 5. 可用`use_emo_text`根据文本自动生成情感向量，可用`use_random`开启随机情感采样：
@@ -396,4 +442,3 @@ IndexTTS:
   url={https://arxiv.org/abs/2502.05512}
 }
 ```
-
