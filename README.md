@@ -202,6 +202,25 @@ uv run webui.py -h
 
 For production deployment, see the [vLLM recipe for IndexTTS](https://recipes.vllm.ai/IndexTeam/IndexTTS-2.5).
 
+### Batch generation
+
+`batch_gen.py` writes one WAV file per non-empty input line. On MPS it clears
+unused allocator memory after each line, splits long text, and retries a segment
+that reaches the configured generation limit before running the memory-intensive
+S2Mel stage:
+
+```bash
+python -u batch_gen.py inputs/text.txt \
+  --voice inputs/prompt.wav \
+  --output_dir outputs/batch \
+  --lang ZH \
+  --device mps
+```
+
+Use `--skip_existing` to resume an interrupted batch. CUDA and XPU keep their
+allocator caches by default for throughput; `--clear_device_cache` enables
+per-line clearing explicitly on any accelerator.
+
 ### 🚀 FastAPI and MCP services
 
 After installing dependencies and downloading the checkpoints, start the HTTP
@@ -235,8 +254,15 @@ Useful environment variables:
 - `INDEXTTS_USE_QWEN_EMO`: emotion-text guidance is enabled by default; set to `0` to disable it.
 - `INDEXTTS_USE_ACCEL`: set to `1` to enable the GPT acceleration engine.
 - `INDEXTTS_USE_TORCH_COMPILE`: set to `1` to enable `torch.compile`.
+- `INDEXTTS_MAX_MEL_TOKENS`: service default for generated mel tokens per segment, default `1500`.
+- `INDEXTTS_CLEAR_DEVICE_CACHE`: clear unused allocator memory after each request; defaults to enabled on MPS only.
 - `TTS_INPUT_DIR`: directory for copied or downloaded prompt audio, default `inputs`.
 - `TTS_OUTPUT_DIR`: directory for generated audio, default `outputs`.
+
+On macOS, the scripts default to MPS allocator watermarks of `0.4` (low) and
+`0.6` (high). Existing `PYTORCH_MPS_LOW_WATERMARK_RATIO` and
+`PYTORCH_MPS_HIGH_WATERMARK_RATIO` environment values are preserved, so these
+limits can be tuned without editing the service code.
 
 Available endpoints:
 
@@ -256,6 +282,10 @@ PYTHONPATH="$PYTHONPATH:." uv run python fastapi_service/client.py synthesize \
 The response includes the generated file path. By default, generated audio is
 written under `outputs/`. Interactive API documentation is available at
 `http://127.0.0.1:8000/docs`.
+
+Both service operations accept `max_mel_tokens` and `do_sample`. Reaching the
+mel-token limit is reported as an error before S2Mel runs instead of attempting
+to decode a potentially pathological, very long waveform.
 
 The MCP server exposes the same `tts_synthesize` and `tts_batch_file` operations.
 It uses STDIO by default, or Streamable HTTP (with the legacy SSE route retained)

@@ -21,6 +21,8 @@ from indextts.codec.models import EnhancedCodec
 from indextts.gpt.model_v2 import UnifiedVoice
 from indextts.utils.checkpoint import load_checkpoint
 from indextts.utils.common import save_pcm_wav
+from indextts.utils.device import clear_device_cache, log_device_memory
+from indextts.utils.exceptions import GenerationLengthExceededError
 from indextts.utils.front import TextNormalizer
 from indextts.utils.tokenizer import get_tokenizer, lang_to_token
 from indextts.utils.ja_g2p import JapaneseG2PProcessor
@@ -277,6 +279,7 @@ class IndexTTS2:
         # 进度引用显示（可选）
         self.gr_progress = None
         self.model_version = self.cfg.version if hasattr(self.cfg, "version") else None
+        log_device_memory(self.device, "after model load")
 
     @torch.no_grad()
     def get_emb(self, input_features, attention_mask):
@@ -623,7 +626,7 @@ class IndexTTS2:
                 self.cache_s2mel_style = None
                 self.cache_s2mel_prompt = None
                 self.cache_mel = None
-                torch.cuda.empty_cache()
+                clear_device_cache(self.device)
             audio, sr = self._load_and_cut_audio(spk_audio_prompt, 15, verbose)
             audio_22k = torchaudio.transforms.Resample(sr, 22050)(audio)
             audio_16k = torchaudio.transforms.Resample(sr, 16000)(audio)
@@ -635,12 +638,9 @@ class IndexTTS2:
             attention_mask = attention_mask.to(self.device)
             spk_cond_emb = self.get_emb(input_features, attention_mask)
 
-            # _, S_ref = self.semantic_codec.quantize(spk_cond_emb)
-            S_ref = self.get_emb(input_features, attention_mask)
             ref_mel = self.mel_fn(audio_22k.to(spk_cond_emb.device).float())
             ref_target_lengths = torch.LongTensor([ref_mel.size(2)]).to(ref_mel.device)
 
-            audio_16k = torchaudio.transforms.Resample(sr, 16000)(self._load_and_cut_audio(spk_audio_prompt, 15, verbose)[0])
             feat = torchaudio.compliance.kaldi.fbank(audio_16k.to(ref_mel.device),
                                                     num_mel_bins=80,
                                                     dither=0,
@@ -649,7 +649,6 @@ class IndexTTS2:
             style = self.campplus_model(feat.unsqueeze(0))  # 参考音频的全局style2[1,192]
 
             prompt_condition = self.s2mel.models['length_regulator'](
-                # S_ref,
                 spk_cond_emb,
                 ylens=ref_target_lengths,
                 n_quantizers=3,
@@ -682,14 +681,19 @@ class IndexTTS2:
         if self.cache_emo_cond is None or self.cache_emo_audio_prompt != emo_audio_prompt:
             if self.cache_emo_cond is not None:
                 self.cache_emo_cond = None
-                torch.cuda.empty_cache()
-            emo_audio, _ = self._load_and_cut_audio(emo_audio_prompt,15,verbose,sr=16000)
-            emo_inputs = self.extract_features(emo_audio, sampling_rate=16000, return_tensors="pt")
-            emo_input_features = emo_inputs["input_features"]
-            emo_attention_mask = emo_inputs["attention_mask"]
-            emo_input_features = emo_input_features.to(self.device)
-            emo_attention_mask = emo_attention_mask.to(self.device)
-            emo_cond_emb = self.get_emb(emo_input_features, emo_attention_mask)
+                clear_device_cache(self.device)
+            if emo_audio_prompt == spk_audio_prompt:
+                # Speaker and emotion conditioning use the same feature extractor.
+                # Reuse the speaker embedding when both prompts are the same.
+                emo_cond_emb = spk_cond_emb
+            else:
+                emo_audio, _ = self._load_and_cut_audio(emo_audio_prompt, 15, verbose, sr=16000)
+                emo_inputs = self.extract_features(emo_audio, sampling_rate=16000, return_tensors="pt")
+                emo_input_features = emo_inputs["input_features"]
+                emo_attention_mask = emo_inputs["attention_mask"]
+                emo_input_features = emo_input_features.to(self.device)
+                emo_attention_mask = emo_attention_mask.to(self.device)
+                emo_cond_emb = self.get_emb(emo_input_features, emo_attention_mask)
 
             self.cache_emo_cond = emo_cond_emb
             self.cache_emo_audio_prompt = emo_audio_prompt
@@ -738,6 +742,7 @@ class IndexTTS2:
         num_beams = generation_kwargs.pop("num_beams", 3)
         repetition_penalty = generation_kwargs.pop("repetition_penalty", 10.0)
         max_mel_tokens = generation_kwargs.pop("max_mel_tokens", 1500)
+        raise_on_max_mel_tokens = generation_kwargs.pop("raise_on_max_mel_tokens", False)
         sampling_rate = 22050
 
         wavs = []
@@ -778,7 +783,7 @@ class IndexTTS2:
                         emo_vec=emovec,
                         campplus_embedding=style,
                         wav=spk_audio_prompt,
-                        do_sample=True,
+                        do_sample=do_sample,
                         top_p=top_p,
                         top_k=top_k,
                         temperature=temperature,
@@ -791,14 +796,22 @@ class IndexTTS2:
                     )
 
                 gpt_gen_time += time.perf_counter() - m_start_time
-                if not has_warned and (codes[:, -1] != self.stop_mel_token).any():
-                    warnings.warn(
-                        f"WARN: generation stopped due to exceeding `max_mel_tokens` ({max_mel_tokens}). "
-                        f"Input text tokens: {text_tokens.shape[1]}. "
-                        f"Consider reducing `max_text_tokens_per_segment`({max_text_tokens_per_segment}) or increasing `max_mel_tokens`.",
-                        category=RuntimeWarning
+                log_device_memory(
+                    self.device,
+                    f"after GPT (segment {seg_idx + 1}/{segments_count})",
+                )
+                exceeded_limit = (codes[:, -1] != self.stop_mel_token).any()
+                if exceeded_limit:
+                    error = GenerationLengthExceededError(
+                        max_mel_tokens=max_mel_tokens,
+                        input_text_tokens=text_tokens.shape[1],
+                        max_text_tokens_per_segment=max_text_tokens_per_segment,
                     )
-                    has_warned = True
+                    if raise_on_max_mel_tokens:
+                        raise error
+                    if not has_warned:
+                        warnings.warn(str(error), category=RuntimeWarning)
+                        has_warned = True
 
                 code_lens = torch.tensor([codes.shape[-1]], device=codes.device, dtype=codes.dtype)
                 #                 if verbose:
@@ -845,11 +858,19 @@ class IndexTTS2:
                                                                    inference_cfg_rate=inference_cfg_rate)
                     vc_target = vc_target[:, :, ref_mel.size(-1):]
                     s2mel_time += time.perf_counter() - m_start_time
+                    log_device_memory(
+                        self.device,
+                        f"after CFM (segment {seg_idx + 1}/{segments_count})",
+                    )
 
                     m_start_time = time.perf_counter()
                     wav = self.bigvgan(vc_target.float()).squeeze().unsqueeze(0)
                     print(wav.shape)
                     bigvgan_time += time.perf_counter() - m_start_time
+                    log_device_memory(
+                        self.device,
+                        f"after BigVGAN (segment {seg_idx + 1}/{segments_count})",
+                    )
                     wav = wav.squeeze(1)
 
                 wav = torch.clamp(32767 * wav, -32767.0, 32767.0)

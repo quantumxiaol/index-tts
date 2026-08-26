@@ -20,6 +20,8 @@ from indextts.gpt.model_v2 import UnifiedVoice
 from indextts.codec.maskgct_codec import build_semantic_codec
 from indextts.utils.checkpoint import load_checkpoint
 from indextts.utils.common import save_pcm_wav
+from indextts.utils.device import clear_device_cache
+from indextts.utils.exceptions import GenerationLengthExceededError
 from indextts.utils.front import TextNormalizer, TextTokenizer
 
 from indextts.s2mel.modules.commons import load_checkpoint2, MyModel
@@ -450,7 +452,7 @@ class IndexTTS2:
                 self.cache_s2mel_style = None
                 self.cache_s2mel_prompt = None
                 self.cache_mel = None
-                torch.cuda.empty_cache()
+                clear_device_cache(self.device)
             audio,sr = self._load_and_cut_audio(spk_audio_prompt,15,verbose)
             audio_22k = torchaudio.transforms.Resample(sr, 22050)(audio)
             audio_16k = torchaudio.transforms.Resample(sr, 16000)(audio)
@@ -504,7 +506,7 @@ class IndexTTS2:
         if self.cache_emo_cond is None or self.cache_emo_audio_prompt != emo_audio_prompt:
             if self.cache_emo_cond is not None:
                 self.cache_emo_cond = None
-                torch.cuda.empty_cache()
+                clear_device_cache(self.device)
             emo_audio, _ = self._load_and_cut_audio(emo_audio_prompt,15,verbose,sr=16000)
             emo_inputs = self.extract_features(emo_audio, sampling_rate=16000, return_tensors="pt")
             emo_input_features = emo_inputs["input_features"]
@@ -543,6 +545,7 @@ class IndexTTS2:
         num_beams = generation_kwargs.pop("num_beams", 3)
         repetition_penalty = generation_kwargs.pop("repetition_penalty", 10.0)
         max_mel_tokens = generation_kwargs.pop("max_mel_tokens", 1500)
+        raise_on_max_mel_tokens = generation_kwargs.pop("raise_on_max_mel_tokens", False)
         sampling_rate = 22050
 
         wavs = []
@@ -587,7 +590,7 @@ class IndexTTS2:
                         cond_lengths=torch.tensor([spk_cond_emb.shape[-1]], device=text_tokens.device),
                         emo_cond_lengths=torch.tensor([emo_cond_emb.shape[-1]], device=text_tokens.device),
                         emo_vec=emovec,
-                        do_sample=True,
+                        do_sample=do_sample,
                         top_p=top_p,
                         top_k=top_k,
                         temperature=temperature,
@@ -600,14 +603,18 @@ class IndexTTS2:
                     )
 
                 gpt_gen_time += time.perf_counter() - m_start_time
-                if not has_warned and (codes[:, -1] != self.stop_mel_token).any():
-                    warnings.warn(
-                        f"WARN: generation stopped due to exceeding `max_mel_tokens` ({max_mel_tokens}). "
-                        f"Input text tokens: {text_tokens.shape[1]}. "
-                        f"Consider reducing `max_text_tokens_per_segment`({max_text_tokens_per_segment}) or increasing `max_mel_tokens`.",
-                        category=RuntimeWarning
+                exceeded_limit = (codes[:, -1] != self.stop_mel_token).any()
+                if exceeded_limit:
+                    error = GenerationLengthExceededError(
+                        max_mel_tokens=max_mel_tokens,
+                        input_text_tokens=text_tokens.shape[1],
+                        max_text_tokens_per_segment=max_text_tokens_per_segment,
                     )
-                    has_warned = True
+                    if raise_on_max_mel_tokens:
+                        raise error
+                    if not has_warned:
+                        warnings.warn(str(error), category=RuntimeWarning)
+                        has_warned = True
 
                 code_lens = torch.tensor([codes.shape[-1]], device=codes.device, dtype=codes.dtype)
                 #                 if verbose:

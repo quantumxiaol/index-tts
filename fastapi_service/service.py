@@ -1,22 +1,26 @@
 import os
-import platform
 import shutil
 import threading
 import uuid
 from typing import List, Optional, Sequence
 
-if platform.system() == "Darwin":
-    # Configure MPS to fall back to CPU and avoid memory pressure on macOS.
-    os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
-    os.environ["PYTORCH_MPS_LOW_WATERMARK_RATIO"] = "0.6"
-    os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.8"
-    print(">> [System] macOS detected; applied MPS memory watermarks (Low=0.6, High=0.8).")
+from indextts.utils.runtime import configure_mps_environment
+
+_mps_environment = configure_mps_environment()
+if _mps_environment:
+    print(
+        ">> [System] macOS detected; MPS watermarks: "
+        f"Low={_mps_environment['PYTORCH_MPS_LOW_WATERMARK_RATIO']}, "
+        f"High={_mps_environment['PYTORCH_MPS_HIGH_WATERMARK_RATIO']}"
+    )
 
 import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from indextts.infer_v2_5 import IndexTTS2
+from indextts.utils.device import clear_device_cache, device_type, log_device_memory
+from indextts.utils.exceptions import GenerationLengthExceededError
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -55,6 +59,13 @@ tts = IndexTTS2(
     device=DEVICE,
 )
 _tts_lock = threading.Lock()
+CLEAR_DEVICE_CACHE = _env_flag(
+    "INDEXTTS_CLEAR_DEVICE_CACHE",
+    default=device_type(tts.device) == "mps",
+)
+DEFAULT_MAX_MEL_TOKENS = int(os.getenv("INDEXTTS_MAX_MEL_TOKENS", "1500"))
+if DEFAULT_MAX_MEL_TOKENS < 1:
+    raise ValueError("INDEXTTS_MAX_MEL_TOKENS must be positive.")
 
 
 def _ensure_dirs() -> None:
@@ -144,6 +155,15 @@ def _get_sample_rate() -> Optional[int]:
         return None
 
 
+def _run_inference(**kwargs):
+    try:
+        return tts.infer(**kwargs)
+    finally:
+        if CLEAR_DEVICE_CACHE:
+            clear_device_cache(tts.device, collect_garbage=True)
+            log_device_memory(tts.device, "after cleanup")
+
+
 class SynthesizeRequest(BaseModel):
     text: str
     prompt_wav_path: str
@@ -155,8 +175,10 @@ class SynthesizeRequest(BaseModel):
     use_emo_text: bool = False
     emo_text: Optional[str] = None
     use_random: bool = False
+    do_sample: bool = True
     interval_silence: int = Field(default=200, ge=0)
     max_text_tokens_per_segment: int = Field(default=120, ge=1)
+    max_mel_tokens: int = Field(default=DEFAULT_MAX_MEL_TOKENS, ge=1)
     duration_factor: float = Field(default=1.0, ge=0.5, le=2.0)
     text_normalization: bool = True
     verbose: bool = False
@@ -181,8 +203,10 @@ class BatchFileRequest(BaseModel):
     use_emo_text: bool = False
     emo_text: Optional[str] = None
     use_random: bool = False
+    do_sample: bool = True
     interval_silence: int = Field(default=200, ge=0)
     max_text_tokens_per_segment: int = Field(default=120, ge=1)
+    max_mel_tokens: int = Field(default=DEFAULT_MAX_MEL_TOKENS, ge=1)
     duration_factor: float = Field(default=1.0, ge=0.5, le=2.0)
     text_normalization: bool = True
     verbose: bool = False
@@ -210,24 +234,30 @@ def tts_synthesize(payload: SynthesizeRequest) -> SynthesizeResponse:
         raise HTTPException(status_code=status_code, detail=str(exc)) from exc
     out_path = _build_output_path(payload.output_name)
     effective_use_emo_text = payload.use_emo_text or (payload.emo_text is not None)
-    with _tts_lock:
-        tts.infer(
-            spk_audio_prompt=prompt_path,
-            text=payload.text,
-            output_path=out_path,
-            lang=language,
-            emo_audio_prompt=emo_prompt_path,
-            emo_alpha=payload.emo_alpha,
-            emo_vector=list(payload.emo_vector) if payload.emo_vector is not None else None,
-            use_emo_text=effective_use_emo_text,
-            emo_text=payload.emo_text,
-            use_random=payload.use_random,
-            interval_silence=payload.interval_silence,
-            verbose=payload.verbose,
-            max_text_tokens_per_segment=payload.max_text_tokens_per_segment,
-            duration_factor=payload.duration_factor,
-            text_normalization=payload.text_normalization,
-        )
+    try:
+        with _tts_lock:
+            _run_inference(
+                spk_audio_prompt=prompt_path,
+                text=payload.text,
+                output_path=out_path,
+                lang=language,
+                emo_audio_prompt=emo_prompt_path,
+                emo_alpha=payload.emo_alpha,
+                emo_vector=list(payload.emo_vector) if payload.emo_vector is not None else None,
+                use_emo_text=effective_use_emo_text,
+                emo_text=payload.emo_text,
+                use_random=payload.use_random,
+                interval_silence=payload.interval_silence,
+                verbose=payload.verbose,
+                max_text_tokens_per_segment=payload.max_text_tokens_per_segment,
+                max_mel_tokens=payload.max_mel_tokens,
+                raise_on_max_mel_tokens=True,
+                do_sample=payload.do_sample,
+                duration_factor=payload.duration_factor,
+                text_normalization=payload.text_normalization,
+            )
+    except GenerationLengthExceededError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return SynthesizeResponse(
         status="success",
         audio_path=out_path,
@@ -258,32 +288,38 @@ def tts_batch_file(payload: BatchFileRequest) -> BatchFileResponse:
 
     output_paths: List[str] = []
     effective_use_emo_text = payload.use_emo_text or (payload.emo_text is not None)
-    with _tts_lock:
-        with open(text_path, "r", encoding="utf-8") as handle:
-            for line_no, line in enumerate(handle, start=1):
-                text = line.strip()
-                if not text:
-                    continue
-                output_name = f"{base_name}_{line_no}.wav"
-                out_path = _build_output_path(output_name)
-                tts.infer(
-                    spk_audio_prompt=prompt_path,
-                    text=text,
-                    output_path=out_path,
-                    lang=language,
-                    emo_audio_prompt=emo_prompt_path,
-                    emo_alpha=payload.emo_alpha,
-                    emo_vector=list(payload.emo_vector) if payload.emo_vector is not None else None,
-                    use_emo_text=effective_use_emo_text,
-                    emo_text=payload.emo_text,
-                    use_random=payload.use_random,
-                    interval_silence=payload.interval_silence,
-                    verbose=payload.verbose,
-                    max_text_tokens_per_segment=payload.max_text_tokens_per_segment,
-                    duration_factor=payload.duration_factor,
-                    text_normalization=payload.text_normalization,
-                )
-                output_paths.append(out_path)
+    try:
+        with _tts_lock:
+            with open(text_path, "r", encoding="utf-8") as handle:
+                for line_no, line in enumerate(handle, start=1):
+                    text = line.strip()
+                    if not text:
+                        continue
+                    output_name = f"{base_name}_{line_no}.wav"
+                    out_path = _build_output_path(output_name)
+                    _run_inference(
+                        spk_audio_prompt=prompt_path,
+                        text=text,
+                        output_path=out_path,
+                        lang=language,
+                        emo_audio_prompt=emo_prompt_path,
+                        emo_alpha=payload.emo_alpha,
+                        emo_vector=list(payload.emo_vector) if payload.emo_vector is not None else None,
+                        use_emo_text=effective_use_emo_text,
+                        emo_text=payload.emo_text,
+                        use_random=payload.use_random,
+                        interval_silence=payload.interval_silence,
+                        verbose=payload.verbose,
+                        max_text_tokens_per_segment=payload.max_text_tokens_per_segment,
+                        max_mel_tokens=payload.max_mel_tokens,
+                        raise_on_max_mel_tokens=True,
+                        do_sample=payload.do_sample,
+                        duration_factor=payload.duration_factor,
+                        text_normalization=payload.text_normalization,
+                    )
+                    output_paths.append(out_path)
+    except GenerationLengthExceededError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     return BatchFileResponse(
         status="success",

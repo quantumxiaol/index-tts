@@ -58,13 +58,29 @@ def _add_common_tts_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--use-emo-text", action="store_true", help="Enable emotion-from-text mode")
     parser.add_argument("--emo-text", help="Optional emotion description text")
-    parser.add_argument("--use-random", action="store_true", help="Enable stochastic generation")
+    parser.add_argument(
+        "--use-random",
+        action="store_true",
+        help="Use random emotion reference embeddings",
+    )
+    parser.add_argument(
+        "--do-sample",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable or disable GPT sampling",
+    )
     parser.add_argument("--interval-silence", type=int, default=200, help="Silence between segments in milliseconds")
     parser.add_argument(
         "--max-text-tokens-per-segment",
         type=int,
         default=120,
         help="Maximum text tokens per synthesis segment",
+    )
+    parser.add_argument(
+        "--max-mel-tokens",
+        type=int,
+        default=None,
+        help="Maximum generated mel tokens per segment (default: server setting)",
     )
     parser.add_argument(
         "--duration-factor",
@@ -91,12 +107,15 @@ def _build_payload(args: argparse.Namespace) -> dict[str, Any]:
         "use_emo_text": args.use_emo_text,
         "emo_text": args.emo_text,
         "use_random": args.use_random,
+        "do_sample": args.do_sample,
         "interval_silence": args.interval_silence,
         "max_text_tokens_per_segment": args.max_text_tokens_per_segment,
         "duration_factor": args.duration_factor,
         "text_normalization": args.text_normalization,
         "verbose": args.verbose,
     }
+    if args.max_mel_tokens is not None:
+        payload["max_mel_tokens"] = args.max_mel_tokens
 
     if args.command == "synthesize":
         payload["text"] = args.text

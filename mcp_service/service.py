@@ -1,21 +1,25 @@
 import os
-import platform
 import shutil
 import threading
 import uuid
 from typing import Any, Dict, Optional, Sequence
 
-if platform.system() == "Darwin":
-    # Configure MPS to fall back to CPU and avoid memory pressure on macOS.
-    os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
-    os.environ["PYTORCH_MPS_LOW_WATERMARK_RATIO"] = "0.6"
-    os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.8"
-    print(">> [System] macOS detected; applied MPS memory watermarks (Low=0.6, High=0.8).")
+from indextts.utils.runtime import configure_mps_environment
+
+_mps_environment = configure_mps_environment()
+if _mps_environment:
+    print(
+        ">> [System] macOS detected; MPS watermarks: "
+        f"Low={_mps_environment['PYTORCH_MPS_LOW_WATERMARK_RATIO']}, "
+        f"High={_mps_environment['PYTORCH_MPS_HIGH_WATERMARK_RATIO']}"
+    )
 
 import httpx
 from mcp.server import FastMCP
 
 from indextts.infer_v2_5 import IndexTTS2
+from indextts.utils.device import clear_device_cache, device_type, log_device_memory
+from indextts.utils.exceptions import GenerationLengthExceededError
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -54,6 +58,13 @@ tts = IndexTTS2(
     device=DEVICE,
 )
 _tts_lock = threading.Lock()
+CLEAR_DEVICE_CACHE = _env_flag(
+    "INDEXTTS_CLEAR_DEVICE_CACHE",
+    default=device_type(tts.device) == "mps",
+)
+DEFAULT_MAX_MEL_TOKENS = int(os.getenv("INDEXTTS_MAX_MEL_TOKENS", "1500"))
+if DEFAULT_MAX_MEL_TOKENS < 1:
+    raise ValueError("INDEXTTS_MAX_MEL_TOKENS must be positive.")
 
 
 def _ensure_dirs() -> None:
@@ -142,6 +153,7 @@ def _validate_options(
     emo_vector: Optional[Sequence[float]],
     interval_silence: int,
     max_text_tokens_per_segment: int,
+    max_mel_tokens: int,
     duration_factor: float,
 ) -> None:
     if not 0.0 <= emo_alpha <= 1.0:
@@ -152,6 +164,8 @@ def _validate_options(
         raise ValueError("interval_silence must be non-negative.")
     if max_text_tokens_per_segment < 1:
         raise ValueError("max_text_tokens_per_segment must be positive.")
+    if max_mel_tokens < 1:
+        raise ValueError("max_mel_tokens must be positive.")
     if not 0.5 <= duration_factor <= 2.0:
         raise ValueError("duration_factor must be between 0.5 and 2.0.")
 
@@ -161,6 +175,15 @@ def _get_sample_rate() -> Optional[int]:
         return int(tts.cfg.s2mel["preprocess_params"]["sr"])
     except (KeyError, TypeError, ValueError):
         return None
+
+
+def _run_inference(**kwargs):
+    try:
+        return tts.infer(**kwargs)
+    finally:
+        if CLEAR_DEVICE_CACHE:
+            clear_device_cache(tts.device, collect_garbage=True)
+            log_device_memory(tts.device, "after cleanup")
 
 
 @mcp.tool(
@@ -178,8 +201,10 @@ async def tts_synthesize(
     use_emo_text: bool = False,
     emo_text: Optional[str] = None,
     use_random: bool = False,
+    do_sample: bool = True,
     interval_silence: int = 200,
     max_text_tokens_per_segment: int = 120,
+    max_mel_tokens: int = DEFAULT_MAX_MEL_TOKENS,
     duration_factor: float = 1.0,
     text_normalization: bool = True,
     verbose: bool = False,
@@ -189,6 +214,7 @@ async def tts_synthesize(
         emo_vector=emo_vector,
         interval_silence=interval_silence,
         max_text_tokens_per_segment=max_text_tokens_per_segment,
+        max_mel_tokens=max_mel_tokens,
         duration_factor=duration_factor,
     )
     language = _normalize_language(lang)
@@ -196,24 +222,30 @@ async def tts_synthesize(
     emo_prompt_path = _resolve_optional_audio(emo_audio_prompt)
     out_path = _build_output_path(output_name)
     effective_use_emo_text = use_emo_text or (emo_text is not None)
-    with _tts_lock:
-        tts.infer(
-            spk_audio_prompt=prompt_path,
-            text=text,
-            output_path=out_path,
-            lang=language,
-            emo_audio_prompt=emo_prompt_path,
-            emo_alpha=emo_alpha,
-            emo_vector=list(emo_vector) if emo_vector is not None else None,
-            use_emo_text=effective_use_emo_text,
-            emo_text=emo_text,
-            use_random=use_random,
-            interval_silence=interval_silence,
-            verbose=verbose,
-            max_text_tokens_per_segment=max_text_tokens_per_segment,
-            duration_factor=duration_factor,
-            text_normalization=text_normalization,
-        )
+    try:
+        with _tts_lock:
+            _run_inference(
+                spk_audio_prompt=prompt_path,
+                text=text,
+                output_path=out_path,
+                lang=language,
+                emo_audio_prompt=emo_prompt_path,
+                emo_alpha=emo_alpha,
+                emo_vector=list(emo_vector) if emo_vector is not None else None,
+                use_emo_text=effective_use_emo_text,
+                emo_text=emo_text,
+                use_random=use_random,
+                interval_silence=interval_silence,
+                verbose=verbose,
+                max_text_tokens_per_segment=max_text_tokens_per_segment,
+                max_mel_tokens=max_mel_tokens,
+                raise_on_max_mel_tokens=True,
+                do_sample=do_sample,
+                duration_factor=duration_factor,
+                text_normalization=text_normalization,
+            )
+    except GenerationLengthExceededError as exc:
+        raise ValueError(str(exc)) from exc
     return {
         "status": "success",
         "audio_path": out_path,
@@ -238,8 +270,10 @@ async def tts_batch_file(
     use_emo_text: bool = False,
     emo_text: Optional[str] = None,
     use_random: bool = False,
+    do_sample: bool = True,
     interval_silence: int = 200,
     max_text_tokens_per_segment: int = 120,
+    max_mel_tokens: int = DEFAULT_MAX_MEL_TOKENS,
     duration_factor: float = 1.0,
     text_normalization: bool = True,
     verbose: bool = False,
@@ -249,6 +283,7 @@ async def tts_batch_file(
         emo_vector=emo_vector,
         interval_silence=interval_silence,
         max_text_tokens_per_segment=max_text_tokens_per_segment,
+        max_mel_tokens=max_mel_tokens,
         duration_factor=duration_factor,
     )
     language = _normalize_language(lang)
@@ -263,32 +298,38 @@ async def tts_batch_file(
     output_paths = []
     effective_use_emo_text = use_emo_text or (emo_text is not None)
 
-    with _tts_lock:
-        with open(text_path, "r", encoding="utf-8") as handle:
-            for line_no, line in enumerate(handle, start=1):
-                text = line.strip()
-                if not text:
-                    continue
-                output_name = f"{base_name}_{line_no}.wav"
-                out_path = _build_output_path(output_name)
-                tts.infer(
-                    spk_audio_prompt=prompt_path,
-                    text=text,
-                    output_path=out_path,
-                    lang=language,
-                    emo_audio_prompt=emo_prompt_path,
-                    emo_alpha=emo_alpha,
-                    emo_vector=list(emo_vector) if emo_vector is not None else None,
-                    use_emo_text=effective_use_emo_text,
-                    emo_text=emo_text,
-                    use_random=use_random,
-                    interval_silence=interval_silence,
-                    verbose=verbose,
-                    max_text_tokens_per_segment=max_text_tokens_per_segment,
-                    duration_factor=duration_factor,
-                    text_normalization=text_normalization,
-                )
-                output_paths.append(out_path)
+    try:
+        with _tts_lock:
+            with open(text_path, "r", encoding="utf-8") as handle:
+                for line_no, line in enumerate(handle, start=1):
+                    text = line.strip()
+                    if not text:
+                        continue
+                    output_name = f"{base_name}_{line_no}.wav"
+                    out_path = _build_output_path(output_name)
+                    _run_inference(
+                        spk_audio_prompt=prompt_path,
+                        text=text,
+                        output_path=out_path,
+                        lang=language,
+                        emo_audio_prompt=emo_prompt_path,
+                        emo_alpha=emo_alpha,
+                        emo_vector=list(emo_vector) if emo_vector is not None else None,
+                        use_emo_text=effective_use_emo_text,
+                        emo_text=emo_text,
+                        use_random=use_random,
+                        interval_silence=interval_silence,
+                        verbose=verbose,
+                        max_text_tokens_per_segment=max_text_tokens_per_segment,
+                        max_mel_tokens=max_mel_tokens,
+                        raise_on_max_mel_tokens=True,
+                        do_sample=do_sample,
+                        duration_factor=duration_factor,
+                        text_normalization=text_normalization,
+                    )
+                    output_paths.append(out_path)
+    except GenerationLengthExceededError as exc:
+        raise ValueError(str(exc)) from exc
     return {
         "status": "success",
         "audio_paths": output_paths,
