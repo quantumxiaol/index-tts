@@ -221,6 +221,20 @@ Use `--skip_existing` to resume an interrupted batch. CUDA and XPU keep their
 allocator caches by default for throughput; `--clear_device_cache` enables
 per-line clearing explicitly on any accelerator.
 
+Use `--memory_diagnostics` for synchronized model-load, prompt-conditioning,
+GPT, semantic-codec, length-regulator, CFM, BigVGAN, and CPU-copy memory
+checkpoints. It also prints deltas from the preceding checkpoint. Because this
+mode synchronizes accelerator work, its RTF includes diagnostic overhead:
+
+```bash
+python -u batch_gen.py inputs/text.txt \
+  --voice inputs/prompt.wav \
+  --output_dir outputs/memory-profile \
+  --lang ZH \
+  --device mps \
+  --memory_diagnostics
+```
+
 ### 🚀 FastAPI and MCP services
 
 After installing dependencies and downloading the checkpoints, start the HTTP
@@ -256,6 +270,7 @@ Useful environment variables:
 - `INDEXTTS_USE_TORCH_COMPILE`: set to `1` to enable `torch.compile`.
 - `INDEXTTS_MAX_MEL_TOKENS`: service default for generated mel tokens per segment, default `1500`.
 - `INDEXTTS_CLEAR_DEVICE_CACHE`: clear unused allocator memory after each request; defaults to enabled on MPS only.
+- `INDEXTTS_MEMORY_DIAGNOSTICS`: set to `1` for synchronized, stage-by-stage memory diagnostics; disabled by default.
 - `TTS_INPUT_DIR`: directory for copied or downloaded prompt audio, default `inputs`.
 - `TTS_OUTPUT_DIR`: directory for generated audio, default `outputs`.
 

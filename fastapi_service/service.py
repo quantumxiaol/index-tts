@@ -19,7 +19,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 from indextts.infer_v2_5 import IndexTTS2
-from indextts.utils.device import clear_device_cache, device_type, log_device_memory
+from indextts.utils.device import clear_device_cache, device_type
 from indextts.utils.exceptions import GenerationLengthExceededError
 
 
@@ -40,6 +40,7 @@ USE_DEEPSPEED = _env_flag("INDEXTTS_USE_DEEPSPEED", default=False)
 USE_QWEN_EMO = _env_flag("INDEXTTS_USE_QWEN_EMO", default=True)
 USE_ACCEL = _env_flag("INDEXTTS_USE_ACCEL", default=False)
 USE_TORCH_COMPILE = _env_flag("INDEXTTS_USE_TORCH_COMPILE", default=False)
+MEMORY_DIAGNOSTICS = _env_flag("INDEXTTS_MEMORY_DIAGNOSTICS", default=False)
 
 AUDIO_IN_DIR = os.getenv("TTS_INPUT_DIR", "inputs")
 AUDIO_OUT_DIR = os.getenv("TTS_OUTPUT_DIR", "outputs")
@@ -57,6 +58,7 @@ tts = IndexTTS2(
     use_accel=USE_ACCEL,
     use_torch_compile=USE_TORCH_COMPILE,
     device=DEVICE,
+    memory_diagnostics=MEMORY_DIAGNOSTICS,
 )
 _tts_lock = threading.Lock()
 CLEAR_DEVICE_CACHE = _env_flag(
@@ -160,8 +162,12 @@ def _run_inference(**kwargs):
         return tts.infer(**kwargs)
     finally:
         if CLEAR_DEVICE_CACHE:
-            clear_device_cache(tts.device, collect_garbage=True)
-            log_device_memory(tts.device, "after cleanup")
+            clear_device_cache(
+                tts.device,
+                collect_garbage=True,
+                synchronize=MEMORY_DIAGNOSTICS,
+            )
+            tts.log_memory("after cleanup", synchronize=False)
 
 
 class SynthesizeRequest(BaseModel):

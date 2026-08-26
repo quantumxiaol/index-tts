@@ -12,15 +12,15 @@ if _mps_environment:
     )
 
 from indextts.infer_v2_5 import IndexTTS2
-from indextts.utils.device import clear_device_cache, device_type, log_device_memory
+from indextts.utils.device import clear_device_cache, device_type
 from indextts.utils.exceptions import GenerationLengthExceededError
 
 
-def _release_device_cache(device: str) -> None:
+def _release_device_cache(tts: IndexTTS2) -> None:
     """Release tensors left by the previous utterance without dropping prompt caches."""
-    cleared = clear_device_cache(device, collect_garbage=True, synchronize=True)
+    cleared = clear_device_cache(tts.device, collect_garbage=True, synchronize=True)
     if cleared:
-        log_device_memory(device, "after cleanup")
+        tts.log_memory("after cleanup", synchronize=False)
 
 
 def parse_args():
@@ -123,6 +123,14 @@ def parse_args():
         action="store_true",
         help="Enable verbose logging in inference.",
     )
+    parser.add_argument(
+        "--memory_diagnostics",
+        action="store_true",
+        help=(
+            "Synchronize accelerator stages and print detailed model, prompt, and "
+            "inference memory checkpoints. Diagnostic timings include observer overhead."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -154,6 +162,7 @@ def main():
         use_cuda_kernel=args.use_cuda_kernel,
         use_deepspeed=args.use_deepspeed,
         device=args.device,
+        memory_diagnostics=args.memory_diagnostics,
     )
     clear_cache_after_each = (
         device_type(tts.device) == "mps"
@@ -208,7 +217,7 @@ def main():
                     limit_error = error
                 finally:
                     if clear_cache_after_each or limit_error is not None:
-                        _release_device_cache(tts.device)
+                        _release_device_cache(tts)
 
                 succeeded = result is not None and output_path.is_file() and limit_error is None
                 if succeeded:

@@ -32,6 +32,9 @@ class FakeIndexTTS2:
             )
         return kwargs["output_path"]
 
+    def log_memory(self, *args, **kwargs):
+        return None
+
 
 class ServiceTests(unittest.TestCase):
     def setUp(self):
@@ -58,6 +61,7 @@ class ServiceTests(unittest.TestCase):
             {
                 "TTS_INPUT_DIR": str(self.temp_path / "inputs"),
                 "TTS_OUTPUT_DIR": str(self.temp_path / "outputs"),
+                "INDEXTTS_MEMORY_DIAGNOSTICS": "0",
             },
         )
         module_patch.start()
@@ -88,6 +92,7 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(response.json()["sample_rate"], 22050)
         self.assertIs(service.tts.init_kwargs["use_bf16"], False)
         self.assertIs(service.tts.init_kwargs["use_qwen_emo"], True)
+        self.assertIs(service.tts.init_kwargs["memory_diagnostics"], False)
         self.assertEqual(service.tts.calls[-1]["lang"], "EN")
         self.assertEqual(service.tts.calls[-1]["duration_factor"], 1.2)
         self.assertIs(service.tts.calls[-1]["text_normalization"], False)

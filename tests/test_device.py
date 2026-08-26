@@ -4,6 +4,7 @@ from unittest.mock import patch
 import torch
 
 from indextts.utils.device import (
+    DeviceMemoryTracker,
     DeviceMemorySnapshot,
     clear_device_cache,
     device_type,
@@ -88,11 +89,48 @@ class DeviceMemoryTests(unittest.TestCase):
 
         message = format_device_memory(snapshot, "after GPT")
         self.assertEqual(snapshot.non_tensor_driver, 1024**3)
+        self.assertEqual(snapshot.driver_overhead_cache, 1024**3)
         self.assertIn("process RSS=8.00 GiB", message)
         self.assertIn("MPS tensors=6.00 GiB", message)
         self.assertIn("MPS driver=7.00 GiB", message)
-        self.assertIn("MPS non-tensor driver=1.00 GiB", message)
+        self.assertIn("MPS driver overhead/cache=1.00 GiB", message)
         self.assertIn("MPS driver/recommended=21.9%", message)
+
+    def test_format_can_include_delta_from_previous_checkpoint(self):
+        previous = DeviceMemorySnapshot(
+            device_type="mps",
+            process_rss=2 * 1024**3,
+            tensor_allocated=3 * 1024**3,
+            driver_allocated=4 * 1024**3,
+        )
+        current = DeviceMemorySnapshot(
+            device_type="mps",
+            process_rss=3 * 1024**3,
+            tensor_allocated=4 * 1024**3,
+            driver_allocated=6 * 1024**3,
+        )
+
+        message = format_device_memory(current, "after model", previous=previous)
+
+        self.assertIn("delta since previous", message)
+        self.assertIn("RSS=+1.00 GiB", message)
+        self.assertIn("tensors=+1.00 GiB", message)
+        self.assertIn("driver=+2.00 GiB", message)
+        self.assertIn("overhead/cache=+1.00 GiB", message)
+
+    @patch("indextts.utils.device.log_device_memory")
+    def test_tracker_forwards_previous_snapshot_and_sync_setting(self, log_memory):
+        first = DeviceMemorySnapshot(device_type="cpu", process_rss=1)
+        second = DeviceMemorySnapshot(device_type="cpu", process_rss=2)
+        log_memory.side_effect = [first, second]
+        tracker = DeviceMemoryTracker("cpu", synchronize=True, include_deltas=True)
+
+        tracker.log("first")
+        tracker.log("second")
+
+        self.assertIsNone(log_memory.call_args_list[0].kwargs["previous"])
+        self.assertIs(log_memory.call_args_list[1].kwargs["previous"], first)
+        self.assertTrue(log_memory.call_args_list[1].kwargs["synchronize"])
 
     def test_cpu_format_does_not_report_accelerator_fields(self):
         snapshot = DeviceMemorySnapshot(device_type="cpu", process_rss=2 * 1024**3)

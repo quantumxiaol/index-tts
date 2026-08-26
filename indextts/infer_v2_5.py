@@ -21,7 +21,11 @@ from indextts.codec.models import EnhancedCodec
 from indextts.gpt.model_v2 import UnifiedVoice
 from indextts.utils.checkpoint import load_checkpoint
 from indextts.utils.common import save_pcm_wav
-from indextts.utils.device import clear_device_cache, log_device_memory
+from indextts.utils.device import (
+    DeviceMemoryTracker,
+    clear_device_cache,
+    synchronize_device,
+)
 from indextts.utils.exceptions import GenerationLengthExceededError
 from indextts.utils.front import TextNormalizer
 from indextts.utils.tokenizer import get_tokenizer, lang_to_token
@@ -78,7 +82,8 @@ def apply_pronunciation_annotations(text: str) -> str:
 class IndexTTS2:
     def __init__(
             self, cfg_path="checkpoints/config.yaml", model_dir="checkpoints", use_bf16=False, device=None,
-            use_cuda_kernel=None,use_deepspeed=False, use_accel=False, use_torch_compile=False, use_qwen_emo=False
+            use_cuda_kernel=None, use_deepspeed=False, use_accel=False, use_torch_compile=False,
+            use_qwen_emo=False, memory_diagnostics=False,
     ):
         """
         Args:
@@ -93,6 +98,9 @@ class IndexTTS2:
             use_qwen_emo (bool): if True, load the QwenEmotion text-to-emotion model.
                 Required for ``infer(..., use_emo_text=True)``. Attempting to use emotion-text
                 guidance when this is disabled will raise a RuntimeError.
+            memory_diagnostics (bool): emit synchronized, stage-by-stage process and
+                accelerator memory snapshots. This is intended for diagnostics and
+                changes asynchronous execution timing when enabled.
         """
         if device is not None:
             self.device = device
@@ -116,6 +124,19 @@ class IndexTTS2:
             self.use_cuda_kernel = False
             print(">> Be patient, it may take a while to run in CPU mode.")
 
+        self.memory_diagnostics = bool(memory_diagnostics)
+        self.memory_tracker = DeviceMemoryTracker(
+            self.device,
+            synchronize=self.memory_diagnostics,
+            include_deltas=self.memory_diagnostics,
+        )
+        if self.memory_diagnostics:
+            print(
+                ">> [Memory] detailed diagnostics enabled; accelerator stages are "
+                "synchronized and diagnostic RTF includes observer overhead"
+            )
+            self._log_memory("diagnostics baseline", detailed_only=True)
+
         self.cfg = OmegaConf.load(cfg_path)
         self.model_dir = model_dir
         self.dtype = torch.bfloat16 if self.use_bf16 else None
@@ -134,6 +155,7 @@ class IndexTTS2:
 
         if use_qwen_emo:
             self.qwen_emo = QwenEmotion(os.path.join(self.model_dir, self.cfg.qwen_emo_path))
+            self._log_memory("after QwenEmotion load", detailed_only=True)
         else:
             self.qwen_emo = None
             print(">> QwenEmotion not loaded (use_qwen_emo=False)")
@@ -147,6 +169,7 @@ class IndexTTS2:
         else:
             self.gpt.eval()
         print(">> GPT weights restored from:", self.gpt_path)
+        self._log_memory("after GPT weights load", detailed_only=True)
 
         if use_deepspeed:
             try:
@@ -156,6 +179,7 @@ class IndexTTS2:
                 print(f">> Failed to load DeepSpeed. Falling back to normal inference. Error: {e}")
 
         self.gpt.post_init_gpt2_config(use_deepspeed=use_deepspeed, kv_cache=True, half=self.use_bf16)
+        self._log_memory("after GPT inference runtime init", detailed_only=True)
 
         if self.use_cuda_kernel:
             # preload the CUDA kernel for BigVGAN
@@ -180,6 +204,7 @@ class IndexTTS2:
         stat_mean_var = torch.load(os.path.join(self.model_dir, self.cfg.w2v_stat))
         self.semantic_mean = stat_mean_var["mean"].to(self.device)
         self.semantic_std = torch.sqrt(stat_mean_var["var"]).to(self.device)
+        self._log_memory("after W2V-BERT load", detailed_only=True)
 
         start_time = time.perf_counter()
         self.semantic_codec = EnhancedCodec(**self.cfg.semantic_codec, cfg=self.cfg.semantic_codec)
@@ -188,6 +213,7 @@ class IndexTTS2:
         print('>> semantic_codec weights restored from:', codec_ckpt_path)
         self.semantic_codec = self.semantic_codec.to(self.device)
         print('>> semantic_codec weights restored cost: ', time.perf_counter() - start_time)
+        self._log_memory("after semantic codec load", detailed_only=True)
 
         s2mel_path = os.path.join(self.model_dir, self.cfg.s2mel_checkpoint)
         s2mel = MyModel(self.cfg.s2mel)
@@ -200,7 +226,9 @@ class IndexTTS2:
             is_distributed=False,
         )
         self.s2mel = s2mel.to(self.device)
+        self._log_memory("after S2Mel weights load", detailed_only=True)
         self.s2mel.models['cfm'].estimator.setup_caches(max_batch_size=1, max_seq_length=8192)
+        self._log_memory("after CFM cache setup", detailed_only=True)
 
         # Enable torch.compile optimization if requested
         if self.use_torch_compile:
@@ -222,6 +250,7 @@ class IndexTTS2:
         self.campplus_model = campplus_model.to(self.device)
         self.campplus_model.eval()
         print(">> campplus_model weights restored from:", campplus_ckpt_path)
+        self._log_memory("after CAMPPlus load", detailed_only=True)
 
         bigvgan_dir = os.path.join(self.model_dir, "hf_cache", "bigvgan")
         if not os.path.isdir(bigvgan_dir):
@@ -233,6 +262,7 @@ class IndexTTS2:
         self.bigvgan.remove_weight_norm()
         self.bigvgan.eval()
         print(">> bigvgan weights restored from:", bigvgan_dir)
+        self._log_memory("after BigVGAN load", detailed_only=True)
 
         self.tokenizer = get_tokenizer(multilingual=True, model_dir=self.model_dir)
         self.ja_text_process = JapaneseG2PProcessor(g2p_ratio=0)
@@ -254,6 +284,7 @@ class IndexTTS2:
 
         self.emo_matrix = torch.split(self.emo_matrix, self.emo_num)
         self.spk_matrix = torch.split(self.spk_matrix, self.emo_num)
+        self._log_memory("after speaker/emotion matrices load", detailed_only=True)
 
         mel_fn_args = {
             "n_fft": self.cfg.s2mel['preprocess_params']['spect_params']['n_fft'],
@@ -279,7 +310,38 @@ class IndexTTS2:
         # 进度引用显示（可选）
         self.gr_progress = None
         self.model_version = self.cfg.version if hasattr(self.cfg, "version") else None
-        log_device_memory(self.device, "after model load")
+        self._log_memory("after model load")
+
+    def _log_memory(self, stage, *, detailed_only=False, synchronize=None):
+        """Log one ordered memory checkpoint using this instance's settings."""
+        diagnostics_enabled = getattr(self, "memory_diagnostics", False)
+        if detailed_only and not diagnostics_enabled:
+            return None
+        tracker = getattr(self, "memory_tracker", None)
+        if tracker is None:
+            tracker = DeviceMemoryTracker(self.device)
+            self.memory_tracker = tracker
+        return tracker.log(stage, synchronize=synchronize)
+
+    def log_memory(self, stage, *, synchronize=None):
+        """Expose an ordered checkpoint to batch and service entrypoints."""
+        return self._log_memory(stage, synchronize=synchronize)
+
+    def _finish_profiled_stage(self, start_time, stage):
+        """Finish a stage, synchronizing first only in detailed diagnostic mode."""
+        if getattr(self, "memory_diagnostics", False):
+            synchronize_device(self.device)
+        elapsed = time.perf_counter() - start_time
+        self._log_memory(stage, synchronize=False)
+        return elapsed
+
+    def _finish_detailed_substage(self, start_time, stage):
+        """Measure and optionally log a substage that is quiet in normal mode."""
+        if getattr(self, "memory_diagnostics", False):
+            synchronize_device(self.device)
+        elapsed = time.perf_counter() - start_time
+        self._log_memory(stage, detailed_only=True, synchronize=False)
+        return elapsed
 
     @torch.no_grad()
     def get_emb(self, input_features, attention_mask):
@@ -582,6 +644,7 @@ class IndexTTS2:
                   f"emo_vector:{emo_vector}, use_emo_text:{use_emo_text}, "
                   f"emo_text:{emo_text}")
         start_time = time.perf_counter()
+        self._log_memory("request start", detailed_only=True)
 
         if use_emo_text or emo_vector is not None:
             # we're using a text or emotion vector guidance; so we must remove
@@ -621,12 +684,16 @@ class IndexTTS2:
 
         # 如果参考音频改变了，才需要重新生成, 提升速度
         if self.cache_spk_cond is None or self.cache_spk_audio_prompt != spk_audio_prompt:
+            self._log_memory("before speaker prompt preprocessing", detailed_only=True)
             if self.cache_spk_cond is not None:
                 self.cache_spk_cond = None
                 self.cache_s2mel_style = None
                 self.cache_s2mel_prompt = None
                 self.cache_mel = None
-                clear_device_cache(self.device)
+                clear_device_cache(
+                    self.device,
+                    synchronize=getattr(self, "memory_diagnostics", False),
+                )
             audio, sr = self._load_and_cut_audio(spk_audio_prompt, 15, verbose)
             audio_22k = torchaudio.transforms.Resample(sr, 22050)(audio)
             audio_16k = torchaudio.transforms.Resample(sr, 16000)(audio)
@@ -637,9 +704,11 @@ class IndexTTS2:
             input_features = input_features.to(self.device)
             attention_mask = attention_mask.to(self.device)
             spk_cond_emb = self.get_emb(input_features, attention_mask)
+            self._log_memory("after speaker W2V-BERT", detailed_only=True)
 
             ref_mel = self.mel_fn(audio_22k.to(spk_cond_emb.device).float())
             ref_target_lengths = torch.LongTensor([ref_mel.size(2)]).to(ref_mel.device)
+            self._log_memory("after reference mel", detailed_only=True)
 
             feat = torchaudio.compliance.kaldi.fbank(audio_16k.to(ref_mel.device),
                                                     num_mel_bins=80,
@@ -647,23 +716,27 @@ class IndexTTS2:
                                                     sample_frequency=16000)
             feat = feat - feat.mean(dim=0, keepdim=True)  # feat2另外一个滤波器能量组特征[922, 80]
             style = self.campplus_model(feat.unsqueeze(0))  # 参考音频的全局style2[1,192]
+            self._log_memory("after prompt CAMPPlus", detailed_only=True)
 
             prompt_condition = self.s2mel.models['length_regulator'](
                 spk_cond_emb,
                 ylens=ref_target_lengths,
                 n_quantizers=3,
                 f0=None)[0]
+            self._log_memory("after prompt length regulator", detailed_only=True)
 
             self.cache_spk_cond = spk_cond_emb
             self.cache_s2mel_style = style
             self.cache_s2mel_prompt = prompt_condition
             self.cache_spk_audio_prompt = spk_audio_prompt
             self.cache_mel = ref_mel
+            self._log_memory("after speaker prompt cache fill", detailed_only=True)
         else:
             style = self.cache_s2mel_style
             prompt_condition = self.cache_s2mel_prompt
             spk_cond_emb = self.cache_spk_cond
             ref_mel = self.cache_mel
+            self._log_memory("speaker prompt cache hit", detailed_only=True)
 
         if emo_vector is not None:
             weight_vector = torch.tensor(emo_vector, device=self.device)
@@ -681,7 +754,10 @@ class IndexTTS2:
         if self.cache_emo_cond is None or self.cache_emo_audio_prompt != emo_audio_prompt:
             if self.cache_emo_cond is not None:
                 self.cache_emo_cond = None
-                clear_device_cache(self.device)
+                clear_device_cache(
+                    self.device,
+                    synchronize=getattr(self, "memory_diagnostics", False),
+                )
             if emo_audio_prompt == spk_audio_prompt:
                 # Speaker and emotion conditioning use the same feature extractor.
                 # Reuse the speaker embedding when both prompts are the same.
@@ -694,11 +770,16 @@ class IndexTTS2:
                 emo_input_features = emo_input_features.to(self.device)
                 emo_attention_mask = emo_attention_mask.to(self.device)
                 emo_cond_emb = self.get_emb(emo_input_features, emo_attention_mask)
+                self._log_memory("after emotion W2V-BERT", detailed_only=True)
 
             self.cache_emo_cond = emo_cond_emb
             self.cache_emo_audio_prompt = emo_audio_prompt
+            self._log_memory("after emotion prompt cache fill", detailed_only=True)
         else:
             emo_cond_emb = self.cache_emo_cond
+            self._log_memory("emotion prompt cache hit", detailed_only=True)
+
+        self._log_memory("after prompt conditioning", detailed_only=True)
 
         self._set_gr_progress(0.1, "text processing...")
         lang_prefix = f'<|{lang.lower()}|> '
@@ -729,6 +810,7 @@ class IndexTTS2:
             toks = torch.IntTensor(toks).unsqueeze(0).to(self.device)
             segment_tokens.append(F.pad(toks, (0, 1), value=1))
         lang = torch.LongTensor([lang_to_token(lang)]).to(self.device)
+        self._log_memory("after text tokenization", detailed_only=True)
         if verbose:
             print("segments count:", segments_count)
             print("max_text_tokens_per_segment:", max_text_tokens_per_segment)
@@ -748,6 +830,9 @@ class IndexTTS2:
         wavs = []
         gpt_gen_time = 0
         s2mel_time = 0
+        semantic_codec_time = 0
+        length_regulator_time = 0
+        cfm_time = 0
         bigvgan_time = 0
         has_warned = False
         silence = None # for stream_return
@@ -758,6 +843,8 @@ class IndexTTS2:
                 print(text_tokens)
                 print(f"text_tokens shape: {text_tokens.shape}, text_tokens type: {text_tokens.dtype}")
 
+            segment_label = f"segment {seg_idx + 1}/{segments_count}"
+            self._log_memory(f"before GPT ({segment_label})", detailed_only=True)
             m_start_time = time.perf_counter()
             with torch.no_grad():
                 with torch.amp.autocast(text_tokens.device.type, enabled=self.dtype is not None, dtype=self.dtype):
@@ -795,10 +882,9 @@ class IndexTTS2:
                         **generation_kwargs
                     )
 
-                gpt_gen_time += time.perf_counter() - m_start_time
-                log_device_memory(
-                    self.device,
-                    f"after GPT (segment {seg_idx + 1}/{segments_count})",
+                gpt_gen_time += self._finish_profiled_stage(
+                    m_start_time,
+                    f"after GPT ({segment_label})",
                 )
                 exceeded_limit = (codes[:, -1] != self.stop_mel_token).any()
                 if exceeded_limit:
@@ -839,37 +925,51 @@ class IndexTTS2:
 
                 dtype = None
                 with torch.amp.autocast(text_tokens.device.type, enabled=dtype is not None, dtype=dtype):
-                    m_start_time = time.perf_counter()
                     diffusion_steps = 25
                     inference_cfg_rate = 0.7
+
+                    substage_start = time.perf_counter()
                     S_infer = self.semantic_codec.decode(codes)
                     target_lengths = torch.LongTensor([int(S_infer.shape[1] * 1.72 * duration_factor)]).to(codes.device)
+                    semantic_codec_elapsed = self._finish_detailed_substage(
+                        substage_start,
+                        f"after semantic codec decode ({segment_label})",
+                    )
+                    semantic_codec_time += semantic_codec_elapsed
 
+                    substage_start = time.perf_counter()
                     cond = self.s2mel.models['length_regulator'](S_infer,
                                                                  ylens=target_lengths,
                                                                  n_quantizers=3,
                                                                  f0=None)[0]
+                    length_regulator_elapsed = self._finish_detailed_substage(
+                        substage_start,
+                        f"after synthesis length regulator ({segment_label})",
+                    )
+                    length_regulator_time += length_regulator_elapsed
 
                     cat_condition = torch.cat([prompt_condition, cond], dim=1)
+                    self._log_memory(f"before CFM ({segment_label})", detailed_only=True)
+                    substage_start = time.perf_counter()
                     vc_target = self.s2mel.models['cfm'].inference(cat_condition,
                                                                    torch.LongTensor([cat_condition.size(1)]).to(
                                                                        cond.device),
                                                                    ref_mel, style, None, diffusion_steps,
                                                                    inference_cfg_rate=inference_cfg_rate)
                     vc_target = vc_target[:, :, ref_mel.size(-1):]
-                    s2mel_time += time.perf_counter() - m_start_time
-                    log_device_memory(
-                        self.device,
-                        f"after CFM (segment {seg_idx + 1}/{segments_count})",
+                    cfm_elapsed = self._finish_profiled_stage(
+                        substage_start,
+                        f"after CFM ({segment_label})",
                     )
+                    cfm_time += cfm_elapsed
+                    s2mel_time += semantic_codec_elapsed + length_regulator_elapsed + cfm_elapsed
 
                     m_start_time = time.perf_counter()
                     wav = self.bigvgan(vc_target.float()).squeeze().unsqueeze(0)
                     print(wav.shape)
-                    bigvgan_time += time.perf_counter() - m_start_time
-                    log_device_memory(
-                        self.device,
-                        f"after BigVGAN (segment {seg_idx + 1}/{segments_count})",
+                    bigvgan_time += self._finish_profiled_stage(
+                        m_start_time,
+                        f"after BigVGAN ({segment_label})",
                     )
                     wav = wav.squeeze(1)
 
@@ -878,6 +978,7 @@ class IndexTTS2:
                     print(f"wav shape: {wav.shape}", "min:", wav.min(), "max:", wav.max())
                 # wavs.append(wav[:, :-512])
                 wavs.append(wav.cpu())  # to cpu before saving
+                self._log_memory(f"after waveform copy to CPU ({segment_label})", detailed_only=True)
                 if stream_return:
                     yield wav.cpu()
                     if silence == None:
@@ -891,6 +992,10 @@ class IndexTTS2:
         wav_length = wav.shape[-1] / sampling_rate
         print(f">> gpt_gen_time: {gpt_gen_time:.2f} seconds")
         print(f">> s2mel_time: {s2mel_time:.2f} seconds")
+        if getattr(self, "memory_diagnostics", False):
+            print(f">> semantic_codec_time: {semantic_codec_time:.2f} seconds")
+            print(f">> length_regulator_time: {length_regulator_time:.2f} seconds")
+            print(f">> cfm_time: {cfm_time:.2f} seconds")
         print(f">> bigvgan_time: {bigvgan_time:.2f} seconds")
         print(f">> Total inference time: {end_time - start_time:.2f} seconds")
         print(f">> Generated audio length: {wav_length:.2f} seconds")
@@ -1090,6 +1195,7 @@ if __name__ == "__main__":
     parser.add_argument("--lang", type=str, default="ZH")
     parser.add_argument("--output", type=str, default="gen.wav")
     parser.add_argument("--text_normalization", action="store_true", default=True)
+    parser.add_argument("--memory_diagnostics", action="store_true")
     args = parser.parse_args()
 
     tts = IndexTTS2(
@@ -1099,6 +1205,7 @@ if __name__ == "__main__":
         use_cuda_kernel=False,
         use_torch_compile=False,
         use_qwen_emo=True,
+        memory_diagnostics=args.memory_diagnostics,
     )
 
     tts.infer(spk_audio_prompt=args.prompt_wav, text=args.text, lang=args.lang, output_path=args.output, verbose=True, text_normalization=args.text_normalization)

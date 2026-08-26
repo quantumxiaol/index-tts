@@ -13,6 +13,7 @@ class FakeIndexTTS2:
     instances = []
 
     def __init__(self, **kwargs):
+        self.init_kwargs = kwargs
         self.calls = []
         self.instances.append(self)
 
@@ -47,6 +48,7 @@ class BatchGenerationTests(unittest.TestCase):
                 str(output_dir),
                 "--device",
                 "cpu",
+                "--memory_diagnostics",
             ]
 
             with (
@@ -61,6 +63,7 @@ class BatchGenerationTests(unittest.TestCase):
             # clears so retries do not retain its generation tensors.
             self.assertEqual(release_cache.call_count, 1)
             calls = FakeIndexTTS2.instances[0].calls
+            self.assertTrue(FakeIndexTTS2.instances[0].init_kwargs["memory_diagnostics"])
             self.assertEqual([call["do_sample"] for call in calls], [False, True])
             self.assertTrue(all(call["raise_on_max_mel_tokens"] for call in calls))
 
